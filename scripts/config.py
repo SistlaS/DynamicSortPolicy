@@ -3,7 +3,8 @@
 # ========================
 
 # The base name of your experiment
-EXPERIMENT_NAME = "exp-30rows-1000keys-zipf2"  # Change if you generate new experiments
+# EXPERIMENT_NAME = "exp-30rows-1000keys-zipf2"  # Change if you generate new experiments
+EXPERIMENT_NAME = "exp-1m-2m-10kkeys-zipf1.5-3parts"
 
 # Number of partitions you want after repartitioning
 NUM_PARTITIONS = 6  # Example (change depending on your balancing goal)

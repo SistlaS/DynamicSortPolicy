@@ -12,7 +12,7 @@ def generate_skewed_keys(num_rows, num_keys, zipf_param=2.0, seed=None):
 def generate_table(num_rows, num_keys, zipf_param=2.0, table_name="left", seed=None):
     keys = generate_skewed_keys(num_rows, num_keys, zipf_param=zipf_param, seed=seed)
     df = pd.DataFrame({
-        'row_id': np.arange(num_rows),
+        f'{table_name}_row_id': np.arange(num_rows),
         'key': keys,
         f'{table_name}_payload': np.random.randint(1, 100000, size=num_rows)
     })
