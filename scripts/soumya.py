@@ -8,7 +8,6 @@ import time
 # Configuration
 # ===================
 from config import (
-    EXPERIMENT_NAME,
     KEY_COLUMN,
     COUNT_COLUMN,
     NUM_PARTITIONS,
@@ -24,15 +23,12 @@ start = time.time()
 
 spark = (
     SparkSession.builder
-    .appName(f"Unified Partitioned Merge Join__{EXPERIMENT_NAME}")
-    .master(SPARK_MASTER_URL) \
-    .config("spark.sql.adaptive.enabled", "false") \
-    .config("spark.sql.autoBroadcastJoinThreshold", "-1") \
-    .config("spark.sql.join.preferSortMergeJoin", "true") \
-    .config("spark.executor.memory", "25g").config("spark.driver.memory", "25g") \
+    .appName("Unified Partitioned Merge Join")
+    .master(SPARK_MASTER_URL)
+    .config("spark.eventLog.enabled", "true")
+    .config("spark.eventLog.dir", "hdfs://nn:9000/spark-logs/")
     .getOrCreate()
 )
-
 
 # Step 1: Read and Count Key Frequencies from Both Tables
 def compute_key_frequencies() -> DataFrame:
@@ -53,11 +49,10 @@ def compute_key_frequencies() -> DataFrame:
 
 # Step 2: Compute Key Ranges
 def compute_key_ranges(key_freqs_df: DataFrame) -> List[Tuple[int, int, int]]:
-    key_freqs_df = key_freqs_df.cache()
-    rows = key_freqs_df.collect()
-    total = sum(row["global_count"] for row in rows)  # use local Python sum
+    total = key_freqs_df.agg(spark_sum("global_count")).collect()[0][0]
     ideal_per_partition = total // NUM_PARTITIONS
 
+    rows = key_freqs_df.collect()
     partitions = []
     current_sum = 0
     current_keys = []
@@ -89,16 +84,11 @@ def filter_join_and_write(partitions: List[Tuple[int, int, int]], output_base: s
     left_df = left_df.select(col("left_row_id"), col(KEY_COLUMN).cast("int"), col("left_payload"))
     right_df = right_df.select(col("right_row_id"), col(KEY_COLUMN).cast("int"), col("right_payload"))
 
-    left_df.cache()
-    right_df.cache()
 
     for pid, start_k, end_k in partitions:
         print(f"Processing partition {pid}: keys {start_k} to {end_k}")
         left_part = left_df.filter((col(KEY_COLUMN) >= start_k) & (col(KEY_COLUMN) <= end_k))
         right_part = right_df.filter((col(KEY_COLUMN) >= start_k) & (col(KEY_COLUMN) <= end_k))
-
-        left_part = left_part.repartition(1, col(KEY_COLUMN))
-        right_part = right_part.repartition(1, col(KEY_COLUMN))
 
         joined = left_part.join(
             right_part,
@@ -108,8 +98,9 @@ def filter_join_and_write(partitions: List[Tuple[int, int, int]], output_base: s
 
         # Write each partition out to its own folder
         output_path = f"{output_base}/partition_{pid}"
-        joined = joined.coalesce(1)
-        joined.write.mode("overwrite").option("header", True).csv(output_path)
+        joined.write.option("header", True).mode("overwrite").csv(output_path)
+        joined.explain(mode="formatted")
+
         print(f"Written partition {pid} to {output_path}")
 
 # ==== Run the Pipeline ====
@@ -132,3 +123,4 @@ spark.stop()
 end = time.time()
 
 print(f"[✔] Total time taken: {end - start:.2f} seconds")
+

@@ -5,8 +5,11 @@ import os
 
 def generate_skewed_keys(num_rows, num_keys, zipf_param=2.0, seed=None):
     np.random.seed(seed)
-    keys = np.random.zipf(zipf_param, num_rows)
-    keys = np.clip(keys, 1, num_keys)
+    if zipf_param > 0:
+        keys = np.random.zipf(zipf_param, num_rows)
+        keys = np.clip(keys, 1, num_keys)
+    else:
+        keys = np.random.randint(1, num_keys + 1, size=num_rows)
     return keys
 
 def generate_table(num_rows, num_keys, zipf_param=2.0, table_name="left", seed=None):
