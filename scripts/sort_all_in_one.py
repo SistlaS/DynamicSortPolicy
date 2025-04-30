@@ -25,6 +25,9 @@ spark = (
     SparkSession.builder
     .appName("Unified Partitioned Merge Join")
     .master(SPARK_MASTER_URL)
+    .config("spark.eventLog.enabled", "true")
+    .config("spark.log.level", "WARN")
+    .config("spark.eventLog.dir", "hdfs://nn:9000/spark-logs/")
     .getOrCreate()
 )
 
@@ -95,7 +98,9 @@ def filter_join_and_write(partitions: List[Tuple[int, int, int]], output_base: s
 
         # Write each partition out to its own folder
         output_path = f"{output_base}/partition_{pid}"
-        joined.write.option("header", True).csv(output_path)
+        joined.write.option("header", True).mode("overwrite").csv(output_path)
+        joined.explain(mode="formatted")
+
         print(f"Written partition {pid} to {output_path}")
 
 # ==== Run the Pipeline ====
@@ -104,12 +109,13 @@ key_freqs = compute_key_frequencies()
 
 print("[2] Computing key ranges...")
 key_ranges = compute_key_ranges(key_freqs)
+print(f"[✔] Key ranges computed: {key_ranges}")
 #broadcast key_ranges
 broadcast_keys = spark.sparkContext.broadcast(key_ranges)
 
 print("[3] Filtering, joining, and writing partitions...")
 output_base = f"hdfs://nn:9000/data/joined_output"
-filter_join_and_write(broadcast_keys.values, output_base)
+filter_join_and_write(broadcast_keys.value, output_base)
 
 print(f"[✔] All partitions written under {output_base}")
 
