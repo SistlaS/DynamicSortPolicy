@@ -116,110 +116,60 @@ left_with_pid_rdd = left_rdd.map(lambda row: row.asDict()) \
     .map(lambda d: assign_pid_from_dict(d, broadcast_pid_map.value))
 # left_with_pid_rdd = left_rdd.map(lambda row: row.asDict()) \
 #     .map(lambda d: {**d, "pid": get_partition_pid(int(d[KEY_COLUMN]), broadcast_partitions.value)})
-left_with_pid_df = left_with_pid_rdd.map(lambda d: Row(**d)).toDF()
+# left_with_pid_df = left_with_pid_rdd.map(lambda d: Row(**d)).toDF()
 
 right_with_pid_rdd = right_rdd.map(lambda row: row.asDict()) \
     .map(lambda d: assign_pid_from_dict(d, broadcast_pid_map.value))
 # right_with_pid_rdd = right_rdd.map(lambda row: row.asDict()) \
 #     .map(lambda d: {**d, "pid": get_partition_pid(int(d[KEY_COLUMN]), broadcast_partitions.value)})
-right_with_pid_df = right_with_pid_rdd.map(lambda d: Row(**d)).toDF()
+# right_with_pid_df = right_with_pid_rdd.map(lambda d: Row(**d)).toDF()
 
-print(f"*******************Partitions: {NUM_PARTITIONS}********************")
+# print(f"*******************Partitions: {NUM_PARTITIONS}********************")
 
-left_count_before = left_with_pid_df.rdd.mapPartitionsWithIndex(lambda idx, it: [(idx, sum(1 for _ in it))]).collect()
-right_count_before = right_with_pid_df.rdd.mapPartitionsWithIndex(lambda idx, it: [(idx, sum(1 for _ in it))]).collect()
+# left_count_before = left_with_pid_df.rdd.mapPartitionsWithIndex(lambda idx, it: [(idx, sum(1 for _ in it))]).collect()
+# right_count_before = right_with_pid_df.rdd.mapPartitionsWithIndex(lambda idx, it: [(idx, sum(1 for _ in it))]).collect()
 
-print(f"Left count before repartitioning: {left_count_before}")
-print(f"Right count before repartitioning: {right_count_before}")
-
-left_df_partitioned = left_with_pid_df.repartition(NUM_PARTITIONS, int(col("pid")))
-right_df_partitioned = right_with_pid_df.repartition(NUM_PARTITIONS, int(col("pid")))
-
-left_count_after = left_df_partitioned.rdd.mapPartitionsWithIndex(lambda idx, it: [(idx, sum(1 for _ in it))]).collect()
-right_count_after = right_df_partitioned.rdd.mapPartitionsWithIndex(lambda idx, it: [(idx, sum(1 for _ in it))]).collect()
-
-print(f"Left count after repartitioning: {left_count_after}")
-print(f"Right count after repartitioning: {right_count_after}")
+# print(f"Left count before repartitioning: {left_count_before}")
+# print(f"Right count before repartitioning: {right_count_before}")
 
 
-def print_partition_stats(index, iterator):
-    keys = set()
-    row_count = 0
-    for row in iterator:
-        keys.add(row["key"])
-        row_count += 1
-    print(f"[Partition {index}] Row count: {row_count}, Distinct keys: {len(keys)}")
-    if '1' in keys:
-        print(f"[Partition {index}] Found key 1")
-    print(keys)
-    return []
-# === Step 7: Perform Join and Write Output ===
+left_rdd_partitioned = left_with_pid_rdd.map(lambda row: (row["pid"], row)).partitionBy(NUM_PARTITIONS, lambda x: x)
+right_rdd_partitioned = right_with_pid_rdd.map(lambda row: (row["pid"], row)).partitionBy(NUM_PARTITIONS, lambda x: x)
+# left_df_partitioned = left_with_pid_df.repartition(NUM_PARTITIONS, int(col("pid")))
+# right_df_partitioned = right_with_pid_df.repartition(NUM_PARTITIONS, int(col("pid")))
 
-joined_df = left_with_pid_df.join(
-    right_with_pid_df,
-    on=["pid", "key"],
-    how="inner"
-)
+tagged_left = left_rdd_partitioned.mapValues(lambda row: ("left", row))
+tagged_right = right_rdd_partitioned.mapValues(lambda row: ("right", row))
 
-# left_with_pid_df.foreachPartition(lambda it: print_partition_stats(0, it))
-left_df_partitioned.select("key").rdd.mapPartitionsWithIndex(print_partition_stats).collect()
-right_df_partitioned.select("key").rdd.mapPartitionsWithIndex(print_partition_stats).collect()
-# right_with_pid_df.foreachPartition(lambda it: print_partition_stats(1, it))
-joined_df.select("key").rdd.mapPartitionsWithIndex(print_partition_stats).collect()
+unioned = tagged_left.union(tagged_right)
 
+# === Step 3: Group by pid (local only) ===
+grouped_by_pid = unioned.groupByKey()
 
-counts_perpartition = left_with_pid_df.rdd.mapPartitionsWithIndex(lambda idx, it: [(idx, sum(1 for _ in it))]).collect()
+# === Step 4: Join within each partition ===
+def join_within_partition(rows):
+    from collections import defaultdict
+    left_map = defaultdict(list)
+    right_map = defaultdict(list)
+    for tag, row in rows:
+        if tag == "left":
+            left_map[row["key"]].append(row)
+        else:
+            right_map[row["key"]].append(row)
+    for key in left_map:
+        if key in right_map:
+            for l in left_map[key]:
+                for r in right_map[key]:
+                    yield {**l, **r}  # Merge the two dicts
 
-print(counts_per_partition)
-# output_path = "/tmp/partition_counts.txt"  # You can change this to HDFS if needed
+joined_rdd = grouped_by_pid.flatMapValues(join_within_partition)  # (pid, merged_row_dict)
 
-# # === Compute counts ===
-# left_key_distinct_per_partition = (
-#     left_with_pid_df.select("key").rdd
-#     .mapPartitionsWithIndex(
-#         lambda idx, it: [(idx, len(set(row["key"] for row in it)))],  # distinct keys
-#         preservesPartitioning=True
-#     )
-#     .collect()
-# )
-
-# right_key_distinct_per_partition = (
-#     right_with_pid_df.select("key").rdd
-#     .mapPartitionsWithIndex(
-#         lambda idx, it: [(idx, len(set(row["key"] for row in it)))],
-#         preservesPartitioning=True
-#     )
-#     .collect()
-# )
-
-# joined_key_distinct_per_partition = (
-#     joined_df.select("key").rdd
-#     .mapPartitionsWithIndex(
-#         lambda idx, it: [(idx, len(set(row["key"] for row in it)))],
-#         preservesPartitioning=True
-#     )
-#     .collect()
-# )
-
-# # === Write counts to file ===
-# with open("/tmp/distinct_keys_per_partition.txt", "w") as f:
-#     f.write("=== DISTINCT KEYS PER SPARK PARTITION ===\n\n")
-
-#     f.write("LEFT:\n")
-#     for pid, count in sorted(left_key_distinct_per_partition):
-#         f.write(f"Partition {pid}: {count} distinct keys\n")
-
-#     f.write("\nRIGHT:\n")
-#     for pid, count in sorted(right_key_distinct_per_partition):
-#         f.write(f"Partition {pid}: {count} distinct keys\n")
-
-#     f.write("\nJOINED:\n")
-#     for pid, count in sorted(joined_key_distinct_per_partition):
-#         f.write(f"Partition {pid}: {count} distinct keys\n")
+# === Step 5: Convert back to DataFrame ===
+# You can keep pid as a column or drop it
+final_df = joined_rdd.map(lambda x: Row(**x[1])).toDF()
 
 
-
-joined_df.write \
+final_df.write \
     .partitionBy("pid") \
     .option("header", True) \
     .mode("overwrite") \
