@@ -1,153 +1,230 @@
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, Row
 from pyspark.sql.functions import col, sum as spark_sum
-from collections import defaultdict
+from pyspark.sql import DataFrame
 from typing import List, Tuple
 import time
 
+# Configuration
 from config import (
+    EXPERIMENT_NAME,
     KEY_COLUMN,
-    COUNT_COLUMN,
     NUM_PARTITIONS,
     SPARK_MASTER_URL,
     HDFS_LEFT_INPUT_PATH,
     HDFS_RIGHT_INPUT_PATH,
 )
 
+start = time.time()
 
-start_time = time.time()
-
-spark = SparkSession.builder \
-    .appName("RDDPartitionedJoinWithDynamicRanges") \
-    .config("spark.sql.shuffle.partitions", "6") \
+# Initialize Spark session
+spark = (   
+    SparkSession.builder
+    .appName(f"Unified Merge Join with foreachPartition - {EXPERIMENT_NAME}")
+    .master(SPARK_MASTER_URL)
+    .config("spark.sql.adaptive.enabled", "false")
+    .config("spark.sql.autoBroadcastJoinThreshold", "-1")
+    .config("spark.executor.memory", "25g")
+    .config("spark.driver.memory", "25g")
+    .config("spark.eventLog.enabled", "true") 
+    .config("spark.eventLog.dir", "hdfs://nn:9000/spark-logs/") 
+    .config("spark.hadoop.fs.defaultFS", "hdfs://nn:9000") 
     .getOrCreate()
+)
+left_rdd = spark.read.option("header", True).csv(HDFS_LEFT_INPUT_PATH).rdd.cache()
+right_rdd = spark.read.option("header", True).csv(HDFS_RIGHT_INPUT_PATH).rdd.cache()
 
-sc = spark.sparkContext
-
-# ==========================
-# STEP 1: Compute key_ranges
-# ==========================
-
-def compute_key_ranges() -> List[Tuple[int, int, int]]:
-    # Read keys from both inputs as DataFrame
-    left_df = spark.read.option("header", True).csv(HDFS_LEFT_INPUT_PATH).select(col("key").cast("int").alias("key"))
-    right_df = spark.read.option("header", True).csv(HDFS_RIGHT_INPUT_PATH).select(col("key").cast("int").alias("key"))
-
-    both_keys_df = left_df.union(right_df)
-
-    key_freqs = (
-        both_keys_df.groupBy("key")
-        .count()
-        .withColumnRenamed("count", "global_count")
-        .orderBy("key")
+def compute_key_frequencies():
+    left_rdd_counts = left_rdd.map(lambda row: int(row[KEY_COLUMN]))
+    right_rdd_counts = right_rdd.map(lambda row: int(row[KEY_COLUMN]))
+    left_key_freqs = (
+        left_rdd.map(lambda row: int(row[KEY_COLUMN]))
+                .map(lambda k: (k, 1))
+                .reduceByKey(lambda a, b: a + b)
     )
+    right_key_freqs = (
+        right_rdd.map(lambda row: int(row[KEY_COLUMN]))
+                .map(lambda k: (k, 1))
+                .reduceByKey(lambda a, b: a + b)
+    )
+    combined_key_freqs = left_key_freqs.union(right_key_freqs) \
+        .reduceByKey(lambda a, b: a + b)
+    key_freqs_sorted = combined_key_freqs.sortByKey()
+    return key_freqs_sorted
 
-    total = key_freqs.agg(spark_sum("global_count")).collect()[0][0]
+
+#STEP 2: Compute key ranges
+def compute_key_ranges(key_freqs_rdd: DataFrame) -> List[Tuple[int, int, int]]:
+    rows = key_freqs_sorted.collect()  # List of (key, global_count)
+    total = sum([c for _, c in rows])
     ideal_per_partition = total // NUM_PARTITIONS
-
-    rows = key_freqs.collect()
     partitions = []
     current_sum = 0
     current_keys = []
     pid = 0
-
-    for row in rows:
-        k = row["key"]
-        c = row["global_count"]
-        current_sum += c
+    for k, count in rows:
+        current_sum += count
         current_keys.append(k)
-
         if current_sum >= ideal_per_partition and pid < NUM_PARTITIONS - 1:
             partitions.append((pid, current_keys[0], current_keys[-1]))
             pid += 1
             current_sum = 0
             current_keys = []
-
     if current_keys:
         partitions.append((pid, current_keys[0], current_keys[-1]))
-
     return partitions
 
-key_ranges = compute_key_ranges()
-print("[✔] Computed key ranges:", key_ranges)
+def compute_key_ranges_v2(key_freqs_sorted) -> dict:
+    """
+    Assign each key to the partition with the least current load.
+    This is effective when key frequencies are highly skewed.
+    """
+    rows = key_freqs_sorted.collect()  # List of (key, count)
+    partitions_count = [0] * NUM_PARTITIONS
+    # partition_to_keys = {i: [] for i in range(NUM_PARTITIONS)}
+    key_to_partition = {}
+    # Assign each key to the partition with the least current total
+    for k, count in rows:
+        min_partition = partitions_count.index(min(partitions_count))
+        key_to_partition[k] = min_partition
+        partitions_count[min_partition] += count
+    return key_to_partition
 
-# Broadcast ranges for use in RDD logic
-range_broadcast = sc.broadcast(key_ranges)
+#Step 4
 
-# ==========================
-# STEP 2: Load Data as RDDs
-# ==========================
-
-def parse_left(line):
-    fields = line.split(",")
-    return int(fields[1]), ("left", fields[0], fields[2])  # (key, ("left", row_id, payload))
-
-def parse_right(line):
-    fields = line.split(",")
-    return int(fields[1]), ("right", fields[0], fields[2])  # (key, ("right", row_id, payload))
-
-left_rdd = (
-    sc.textFile(HDFS_LEFT_INPUT_PATH)
-    .filter(lambda line: not line.startswith("left_row_id"))
-    .map(parse_left)
-)
-
-right_rdd = (
-    sc.textFile(HDFS_RIGHT_INPUT_PATH)
-    .filter(lambda line: not line.startswith("right_row_id"))
-    .map(parse_right)
-)
-
-# ==========================
-# STEP 3: Partition-Aware Tagging
-# ==========================
-
-def get_partition_id(key: int, ranges: List[Tuple[int, int, int]]) -> int:
-    for pid, start, end in ranges:
+def get_partition_pid(key: int, partition_list: List[Tuple[int, int, int]]) -> int:
+    for pid, start, end in partition_list:
         if start <= key <= end:
             return pid
-    return -1  # fallback
+    return -1
 
-def tag_partition(record):
-    key, data = record
-    pid = get_partition_id(key, range_broadcast.value)
-    return (pid, (key, data))
+def assign_pid_from_dict(row_dict, key_to_pid):
+    key = int(row_dict[KEY_COLUMN])
+    pid = key_to_pid.get(key, -1)  # -1 if key not found
+    return {**row_dict, "pid": pid}
+# =====================================================================
+# PIPELINE
+# =====================================================================
 
-tagged_rdd = left_rdd.union(right_rdd).map(tag_partition)
+key_freqs_sorted = compute_key_frequencies()
+key_to_pid = compute_key_ranges_v2(key_freqs_sorted)
 
-# ==========================
-# STEP 4: Partition and Join
-# ==========================
+broadcast_pid_map = spark.sparkContext.broadcast(key_to_pid)
 
-partitioned = tagged_rdd.partitionBy(NUM_PARTITIONS, lambda pid: pid)
+left_with_pid_rdd = left_rdd.map(lambda row: row.asDict()) \
+    .map(lambda d: assign_pid_from_dict(d, broadcast_pid_map.value))
+# left_with_pid_rdd = left_rdd.map(lambda row: row.asDict()) \
+#     .map(lambda d: {**d, "pid": get_partition_pid(int(d[KEY_COLUMN]), broadcast_partitions.value)})
+# left_with_pid_df = left_with_pid_rdd.map(lambda d: Row(**d)).toDF()
 
-def merge_partition(partition_iter):
-    left_map = defaultdict(list)
-    right_map = defaultdict(list)
-    result = []
+right_with_pid_rdd = right_rdd.map(lambda row: row.asDict()) \
+    .map(lambda d: assign_pid_from_dict(d, broadcast_pid_map.value))
+# right_with_pid_rdd = right_rdd.map(lambda row: row.asDict()) \
+#     .map(lambda d: {**d, "pid": get_partition_pid(int(d[KEY_COLUMN]), broadcast_partitions.value)})
+# right_with_pid_df = right_with_pid_rdd.map(lambda d: Row(**d)).toDF()
 
-    for pid_key, (key, (side, row_id, payload)) in partition_iter:
-        if side == "left":
-            left_map[key].append((row_id, payload))
-        else:
-            right_map[key].append((row_id, payload))
+# print(f"*******************Partitions: {NUM_PARTITIONS}********************")
 
-    for key in left_map.keys() & right_map.keys():
-        for lrow in left_map[key]:
-            for rrow in right_map[key]:
-                result.append((key, lrow[0], lrow[1], rrow[0], rrow[1]))
+# left_count_before = left_with_pid_df.rdd.mapPartitionsWithIndex(lambda idx, it: [(idx, sum(1 for _ in it))]).collect()
+# right_count_before = right_with_pid_df.rdd.mapPartitionsWithIndex(lambda idx, it: [(idx, sum(1 for _ in it))]).collect()
 
-    return iter(result)
+# print(f"Left count before repartitioning: {left_count_before}")
+# print(f"Right count before repartitioning: {right_count_before}")
 
-joined_rdd = partitioned.mapPartitions(merge_partition)
 
-# ==========================
-# STEP 5: Save Output
-# ==========================
-OUTPUT_PATH = "hdfs://nn:9000/data/exp/merged_rdd_output"
+left_rdd_partitioned = left_with_pid_rdd.map(lambda row: (row["pid"], row)).partitionBy(NUM_PARTITIONS, lambda x: x).map(lambda d: Row(**d[1])).toDF()
+right_rdd_partitioned = right_with_pid_rdd.map(lambda row: (row["pid"], row)).partitionBy(NUM_PARTITIONS, lambda x: x).map(lambda d: Row(**d[1])).toDF()
 
-joined_rdd.map(lambda row: ",".join(map(str, row))).saveAsTextFile(OUTPUT_PATH)
+joined_df = left_rdd_partitioned.join(right_rdd_partitioned, on=["pid","key"], how="inner")
 
-spark.stop()
-print(f"[✔] Join complete. Results saved to {OUTPUT_PATH}")
-print(f"[⏱] Total time: {time.time() - start_time:.2f} seconds")
+# left_df_partitioned = left_with_pid_df.repartition(NUM_PARTITIONS, int(col("pid")))
+# right_df_partitioned = right_with_pid_df.repartition(NUM_PARTITIONS, int(col("pid")))
+
+
+# left_rdd_partitioned = left_with_pid_rdd.map(lambda row: (row["pid"], row)).partitionBy(NUM_PARTITIONS, lambda x: x).map(lambda d: Row(**d[1]))
+# right_rdd_partitioned = right_with_pid_rdd.map(lambda row: (row["pid"], row)).partitionBy(NUM_PARTITIONS, lambda x: x).map(lambda d: Row(**d[1]))
+
+# tagged_left = left_rdd_partitioned.mapValues(lambda row: ("left", row))
+# tagged_right = right_rdd_partitioned.mapValues(lambda row: ("right", row))
+
+# unioned = tagged_left.union(tagged_right)
+
+# # === Step 3: Group by pid (local only) ===
+# grouped_by_pid = unioned.groupByKey()
+
+# # # === Step 4: Join within each partition ===
+# def join_within_partition(rows):
+#     from collections import defaultdict
+#     left_map = defaultdict(list)
+#     right_map = defaultdict(list)
+#     for tag, row in rows:
+#         if tag == "left":
+#             left_map[row["key"]].append(row)
+#         else:
+#             right_map[row["key"]].append(row)
+#     for key in left_map:
+#         if key in right_map:
+#             for l in left_map[key]:
+#                 for r in right_map[key]:
+#                     yield {**l, **r}  # Merge the two dicts
+
+# def merge_join_within_partition(rows):
+#     # Separate left and right records
+#     left_rows = []
+#     right_rows = []
+
+#     for tag, row in rows:
+#         if tag == "left":
+#             left_rows.append(row)
+#         else:
+#             right_rows.append(row)
+
+#     # Sort both by key (int keys assumed)
+#     left_rows.sort(key=lambda r: int(r["key"]))
+#     right_rows.sort(key=lambda r: int(r["key"]))
+
+#     # Perform sort-merge join
+#     i, j = 0, 0
+#     while i < len(left_rows) and j < len(right_rows):
+#         l_key = int(left_rows[i]["key"])
+#         r_key = int(right_rows[j]["key"])
+
+#         if l_key == r_key:
+#             # Find all matching keys on both sides
+#             li = i
+#             while li < len(left_rows) and int(left_rows[li]["key"]) == l_key:
+#                 rj = j
+#                 while rj < len(right_rows) and int(right_rows[rj]["key"]) == r_key:
+#                     yield {**left_rows[li], **right_rows[rj]}
+#                     rj += 1
+#                 li += 1
+#             # Advance both pointers to skip duplicates
+#             while i < len(left_rows) and int(left_rows[i]["key"]) == l_key:
+#                 i += 1
+#             while j < len(right_rows) and int(right_rows[j]["key"]) == r_key:
+#                 j += 1
+
+#         elif l_key < r_key:
+#             i += 1
+#         else:
+#             j += 1
+
+
+# joined_rdd = grouped_by_pid.flatMapValues(join_within_partition)
+
+
+# joined_row_rdd = joined_rdd.map(lambda x: Row(**x[1]))  # x[1] is the merged dict
+
+# Step 3: Convert to DataFrame
+# final_df = spark.createDataFrame(joined_row_rdd)
+
+
+# final_df.write \
+#     .partitionBy("pid") \
+#     .option("header", True) \
+#     .mode("overwrite") \
+#     .csv("hdfs://nn:9000/data/output_partitioned_join")
+
+joined_df.write.option("header", True).mode("overwrite").csv("hdfs://nn:9000/data/output_partitioned_join")
+
+# === (Optional) Show Sample ===
 

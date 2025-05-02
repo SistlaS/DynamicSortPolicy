@@ -1,8 +1,5 @@
 from pyspark.sql import SparkSession
 import time
-
-start_time = time.time()
-
 from config import (
     EXPERIMENT_NAME,
     KEY_COLUMN,
@@ -12,34 +9,34 @@ from config import (
     HDFS_RIGHT_INPUT_PATH,
 )
 
-# Build Spark session for AQE with skew join and forced Sort-Merge Join
+start_time = time.time()
+
 spark = SparkSession.builder \
-    .appName(f"Baseline_AQE_Join-{EXPERIMENT_NAME}") \
-    .config("spark.sql.adaptive.enabled", "true") \
-    .config("spark.sql.adaptive.shuffle.targetPostShuffleInputSize", "64MB") \
+    .appName(f"PartitionByRange_SortMerge-{EXPERIMENT_NAME}") \
     .config("spark.sql.autoBroadcastJoinThreshold", "-1") \
-    .config("spark.sql.adaptive.skewJoin.enabled", "true") \
     .config("spark.sql.join.preferSortMergeJoin", "true") \
-    .config("spark.sql.adaptive.localShuffleReader.enabled", "false") \
     .config("spark.executor.memory", "25g") \
     .config("spark.driver.memory", "25g") \
+    .config("spark.sql.shuffle.partitions", str(NUM_PARTITIONS)) \
     .config("spark.eventLog.enabled", "true") \
     .config("spark.eventLog.dir", "hdfs://nn:9000/spark-logs/") \
     .config("spark.hadoop.fs.defaultFS", "hdfs://nn:9000") \
     .getOrCreate()
 
-
-
-# Read CSVs
+# Load CSVs
 left_df = spark.read.csv(HDFS_LEFT_INPUT_PATH, header=True, inferSchema=True)
 right_df = spark.read.csv(HDFS_RIGHT_INPUT_PATH, header=True, inferSchema=True)
 
-# Perform join
-joined = left_df.join(right_df, on="key", how="inner")
+# Repartition using range partitioning to reduce skew
+left_df_repart = left_df.repartitionByRange(NUM_PARTITIONS, KEY_COLUMN)
+right_df_repart = right_df.repartitionByRange(NUM_PARTITIONS, KEY_COLUMN)
+
+# Sort-merge join on the range-partitioned data
+joined = left_df_repart.join(right_df_repart, on=KEY_COLUMN, how="inner")
 
 # Save output
-joined.write.mode("overwrite").csv("hdfs://nn:9000/output/aqe/")
+joined.write.mode("overwrite").csv("hdfs://nn:9000/output/sortmerge_partitioned/")
 
+spark.stop()
 end_time = time.time()
 print(f"Total Runtime: {end_time - start_time:.2f} seconds")
-

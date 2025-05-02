@@ -3,9 +3,9 @@
 # ========================
 
 # The base name of your experiment
-EXPERIMENT_NAME = "exp-5k-5k-skew-2.0-1.1-10keys" # "exp-5k-3k-skew-left-100keys" #"exp-1k-2k-skew1" #"exp-1k-2k-skew-2.0-1.5" #"exp-1k-2k-skew1" #"exp-10k-20k-skewright" # "exp-30rows-1000keys-zipf2"  # Change if you generate new experiments
+#EXPERIMENT_NAME = "exp-5k-5k-skew-2.0-1.1-10keys" # "exp-5k-3k-skew-left-100keys" #"exp-1k-2k-skew1" #"exp-1k-2k-skew-2.0-1.5" #"exp-1k-2k-skew1" #"exp-10k-20k-skewright" # "exp-30rows-1000keys-zipf2"  # Change if you generate new experiments
 #EXPERIMENT_NAME = "exp-1m-2m-10kkeys-zipf1.5-3parts"
-
+EXPERIMENT_NAME = "exp-5k-50k-skew-1.1-1.5-100keys"
 # Number of partitions you want after repartitioning
 NUM_PARTITIONS = 3  # Example (change depending on your balancing goal)
 

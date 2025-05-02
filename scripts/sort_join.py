@@ -1,39 +1,92 @@
-from pyspark.sql import SparkSession
+# from pyspark.sql import SparkSession
 
-# ===================
-# Configuration
-# ===================
+# import time
+# from config import (
+#     EXPERIMENT_NAME,
+#     KEY_COLUMN,
+#     NUM_PARTITIONS,
+#     SPARK_MASTER_URL,
+#     HDFS_LEFT_INPUT_PATH,
+#     HDFS_RIGHT_INPUT_PATH,
+# )
+
+
+
+# start_time = time.time()
+
+# spark = SparkSession.builder \
+#     .appName(f"Baseline_SortMerge-{EXPERIMENT_NAME}") \
+#     .config("spark.sql.autoBroadcastJoinThreshold", "-1") \
+#     .config("spark.sql.join.preferSortMergeJoin", "true") \
+#     .config("spark.executor.memory", "25g") \
+#     .config("spark.driver.memory", "25g") \
+#     .config("spark.sql.shuffle.partitions", str(NUM_PARTITIONS)) \
+#     .config("spark.eventLog.enabled", "true") \
+#     .config("spark.eventLog.dir", "hdfs://nn:9000/spark-logs/") \
+#     .config("spark.hadoop.fs.defaultFS", "hdfs://nn:9000") \
+#     .getOrCreate()
+
+
+# left_df = spark.read.csv(HDFS_LEFT_INPUT_PATH, header=True, inferSchema=True)
+# right_df = spark.read.csv(HDFS_RIGHT_INPUT_PATH, header=True, inferSchema=True)
+
+# # Perform sort-merge join
+# joined = left_df.join(right_df, on="key", how="inner")
+
+# # Save output
+# joined.write.mode("overwrite").csv("hdfs://nn:9000/output/sortmerge/")
+# spark.stop()
+
+# end_time = time.time()
+# print(f"Total Runtime: {end_time - start_time:.2f} seconds")
+
+
+
+from pyspark.sql import SparkSession
+import time
+
 from config import (
     EXPERIMENT_NAME,
     KEY_COLUMN,
-    COUNT_COLUMN,
     NUM_PARTITIONS,
     SPARK_MASTER_URL,
     HDFS_LEFT_INPUT_PATH,
     HDFS_RIGHT_INPUT_PATH,
 )
 
-import time
 start_time = time.time()
 
-NUM_PARTITIONS = 3
 spark = SparkSession.builder \
-    .appName("Baseline_SortMerge") \
-    .config("spark.sql.adaptive.enabled", "false") \
+    .appName(f"Baseline_SortMerge-{EXPERIMENT_NAME}") \
     .config("spark.sql.autoBroadcastJoinThreshold", "-1") \
     .config("spark.sql.join.preferSortMergeJoin", "true") \
+    .config("spark.executor.memory", "25g") \
+    .config("spark.driver.memory", "25g") \
     .config("spark.sql.shuffle.partitions", str(NUM_PARTITIONS)) \
+    .config("spark.eventLog.enabled", "true") \
+    .config("spark.eventLog.dir", "hdfs://nn:9000/spark-logs/") \
+    .config("spark.hadoop.fs.defaultFS", "hdfs://nn:9000") \
     .getOrCreate()
 
+# Read CSVs
 left_df = spark.read.csv(HDFS_LEFT_INPUT_PATH, header=True, inferSchema=True)
 right_df = spark.read.csv(HDFS_RIGHT_INPUT_PATH, header=True, inferSchema=True)
 
+# Ensure the join key is the same type on both sides
+left_df = left_df.withColumn(KEY_COLUMN, left_df[KEY_COLUMN].cast("int"))
+right_df = right_df.withColumn(KEY_COLUMN, right_df[KEY_COLUMN].cast("int"))
 
-# Perform sort-merge join
-joined = left_df.join(right_df, on="key", how="inner")
+# Force sort-merge behavior by repartitioning and sorting both sides on the key
+left_df = left_df.repartition(NUM_PARTITIONS, KEY_COLUMN).sort(KEY_COLUMN)
+right_df = right_df.repartition(NUM_PARTITIONS, KEY_COLUMN).sort(KEY_COLUMN)
 
-# Save output
+# Perform the sort-merge join
+joined = left_df.join(right_df, on=KEY_COLUMN, how="inner")
+
+# Write result to HDFS
 joined.write.mode("overwrite").csv("hdfs://nn:9000/output/sortmerge/")
+
+spark.stop()
 
 end_time = time.time()
 print(f"Total Runtime: {end_time - start_time:.2f} seconds")
